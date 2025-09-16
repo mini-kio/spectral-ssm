@@ -1,5 +1,5 @@
 """
-Training Script for Spectral-Latent SSM
+Training Script for Adaptive-Frequency-SSM
 Supports distributed training, mixed precision, and comprehensive logging
 """
 
@@ -22,7 +22,10 @@ import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
 
-import wandb
+try:
+    import wandb  # Optional; handled gracefully if missing
+except Exception:  # pragma: no cover
+    wandb = None
 from tqdm import tqdm
 import numpy as np
 
@@ -114,7 +117,13 @@ class SpectralSSMTrainer:
         
         # Setup device
         self.device = torch.device(config.device)
-        torch.cuda.set_device(config.local_rank)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(config.local_rank)
+            except Exception:
+                pass
+        else:
+            self.device = torch.device("cpu")
         
         # Setup logging
         self.setup_logging()
@@ -146,7 +155,10 @@ class SpectralSSMTrainer:
             'throughput': [],
         }
         
-        self.log_info(f"Trainer initialized with {self.model.get_num_params():,} parameters")
+        # Handle DDP-wrapped models when counting params
+        base_model = self.model.module if isinstance(self.model, DDP) else self.model
+        num_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+        self.log_info(f"Trainer initialized with {num_params:,} parameters")
     
     def setup_distributed(self):
         """Setup distributed training"""
@@ -167,6 +179,9 @@ class SpectralSSMTrainer:
     
     def setup_logging(self):
         """Setup logging and wandb"""
+        # Ensure save dir exists before creating FileHandler
+        os.makedirs(self.config.save_dir, exist_ok=True)
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -177,21 +192,26 @@ class SpectralSSMTrainer:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Initialize wandb
-        if self.config.local_rank == 0:
-            wandb.init(
-                project=self.config.wandb_project,
-                name=self.config.wandb_name,
-                config=asdict(self.config),
-                tags=["adaptive_frequency_ssm", self.config.task_name]
-            )
+        # Initialize wandb (optional)
+        self.wandb_enabled = False
+        if self.config.local_rank == 0 and wandb is not None:
+            try:
+                wandb.init(
+                    project=self.config.wandb_project,
+                    name=self.config.wandb_name,
+                    config=asdict(self.config),
+                    tags=["adaptive_frequency_ssm", self.config.task_name]
+                )
+                self.wandb_enabled = True
+            except Exception:
+                self.log_info("wandb not available; continuing without it.")
     
     def log_info(self, message: str):
         """Log info message"""
         if self.config.local_rank == 0:
             self.logger.info(message)
     
-    def create_model(self) -> SpectralSSM:
+    def create_model(self) -> AdaptiveFrequencySSM:
         """Create and initialize model"""
         # Determine task type and number of classes
         if self.config.task_name in ['listops', 'text', 'retrieval', 'pathfinder', 'pathx']:
@@ -289,24 +309,41 @@ class SpectralSSMTrainer:
     
     def create_data_loaders(self) -> Tuple[DataLoader, DataLoader]:
         """Create train and validation data loaders"""
-        # This is a placeholder - actual implementation would load specific datasets
-        # For now, create dummy data loaders for testing
+        # Prefer real datasets if available; otherwise, fall back to synthetic
+        try:
+            from .data.lra_datasets import create_lra_dataset
+        except Exception:
+            create_lra_dataset = None
         
-        from .data.lra_datasets import create_lra_dataset
-        
-        train_dataset = create_lra_dataset(
-            task_name=self.config.task_name,
-            data_dir=self.config.data_dir,
-            split='train',
-            max_seq_len=self.config.max_seq_len,
-        )
-        
-        val_dataset = create_lra_dataset(
-            task_name=self.config.task_name,
-            data_dir=self.config.data_dir,
-            split='validation',
-            max_seq_len=self.config.max_seq_len,
-        )
+        if create_lra_dataset is None:
+            # Synthetic fallback dataset
+            class _SyntheticDataset(torch.utils.data.Dataset):
+                def __init__(self, num_samples=1024, seq_len=2048, vocab=50304, num_classes=2):
+                    self.num_samples = num_samples
+                    self.seq_len = seq_len
+                    self.vocab = vocab
+                    self.num_classes = num_classes
+                def __len__(self):
+                    return self.num_samples
+                def __getitem__(self, idx):
+                    x = torch.randint(0, self.vocab, (self.seq_len,), dtype=torch.long)
+                    y = torch.randint(0, self.num_classes, (1,), dtype=torch.long).item()
+                    return {"input_ids": x, "labels": torch.tensor(y, dtype=torch.long)}
+            train_dataset = _SyntheticDataset(seq_len=self.config.max_seq_len)
+            val_dataset = _SyntheticDataset(num_samples=256, seq_len=self.config.max_seq_len)
+        else:
+            train_dataset = create_lra_dataset(
+                task_name=self.config.task_name,
+                data_dir=self.config.data_dir,
+                split='train',
+                max_seq_len=self.config.max_seq_len,
+            )
+            val_dataset = create_lra_dataset(
+                task_name=self.config.task_name,
+                data_dir=self.config.data_dir,
+                split='validation',
+                max_seq_len=self.config.max_seq_len,
+            )
         
         # Create samplers for distributed training
         train_sampler = DistributedSampler(train_dataset) if self.config.distributed else None
@@ -319,7 +356,7 @@ class SpectralSSMTrainer:
             shuffle=(train_sampler is None),
             num_workers=self.config.num_workers,
             pin_memory=self.config.pin_memory,
-            persistent_workers=True,
+            persistent_workers=(self.config.num_workers > 0),
             drop_last=True,
         )
         
@@ -330,7 +367,7 @@ class SpectralSSMTrainer:
             shuffle=False,
             num_workers=self.config.num_workers,
             pin_memory=self.config.pin_memory,
-            persistent_workers=True,
+            persistent_workers=(self.config.num_workers > 0),
             drop_last=False,
         )
         
@@ -345,7 +382,20 @@ class SpectralSSMTrainer:
         labels = batch['labels'].to(self.device, non_blocking=True)
         
         # Forward pass with mixed precision
-        with autocast('cuda', enabled=self.config.use_amp, dtype=torch.bfloat16 if self.config.amp_dtype == "bfloat16" else torch.float16):
+        device_type = self.device.type
+        # Fix: Proper dtype selection based on device capabilities
+        if device_type == 'cpu':
+            # CPU doesn't support bfloat16, use float32
+            amp_dtype = torch.float32
+        elif device_type == 'cuda':
+            # Check GPU capability for bfloat16
+            if self.config.amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+            else:
+                amp_dtype = torch.float16
+        else:
+            amp_dtype = torch.float32
+        with torch.amp.autocast(device_type=device_type, enabled=self.config.use_amp, dtype=amp_dtype):
             outputs = self.model(input_ids=input_ids, labels=labels)
             loss = outputs['loss']
             
@@ -400,7 +450,18 @@ class SpectralSSMTrainer:
                 input_ids = batch['input_ids'].to(self.device, non_blocking=True)
                 labels = batch['labels'].to(self.device, non_blocking=True)
                 
-                with autocast('cuda', enabled=self.config.use_amp, dtype=torch.bfloat16 if self.config.amp_dtype == "bfloat16" else torch.float16):
+                device_type = self.device.type
+                # Fix: Proper dtype selection based on device capabilities
+                if device_type == 'cpu':
+                    amp_dtype = torch.float32
+                elif device_type == 'cuda':
+                    if self.config.amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported():
+                        amp_dtype = torch.bfloat16
+                    else:
+                        amp_dtype = torch.float16
+                else:
+                    amp_dtype = torch.float32
+                with torch.amp.autocast(device_type=device_type, enabled=self.config.use_amp, dtype=amp_dtype):
                     outputs = self.model(input_ids=input_ids, labels=labels)
                     loss = outputs['loss']
                     logits = outputs['logits']
@@ -554,11 +615,14 @@ class SpectralSSMTrainer:
         self.log_info("Training completed!")
         
         # Clear GPU cache after training
-        if torch.cuda.is_available():
+        if self.device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        if self.config.local_rank == 0:
-            wandb.finish()
+        if self.config.local_rank == 0 and getattr(self, 'wandb_enabled', False):
+            try:
+                wandb.finish()
+            except Exception:
+                pass
     
     def log_metrics(self, metrics: Dict[str, float]):
         """Log metrics to wandb and console"""
@@ -571,7 +635,11 @@ class SpectralSSMTrainer:
                 self.training_stats[key].append(value)
         
         # Log to wandb
-        wandb.log({**metrics, 'step': self.global_step})
+        if getattr(self, 'wandb_enabled', False):
+            try:
+                wandb.log({**metrics, 'step': self.global_step})
+            except Exception:
+                pass
         
         # Log to console
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])

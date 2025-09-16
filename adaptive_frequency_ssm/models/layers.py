@@ -11,12 +11,11 @@ from typing import Optional, Tuple, Union
 from einops import rearrange, repeat
 
 from ..utils.fft_utils import (
-    slice_low_frequencies, 
-    pad_and_reconstruct, 
+    slice_low_frequencies,
+    pad_and_reconstruct,
     AdaptiveFrequencyMask,
     frequency_dropout,
-    spectral_norm_regularization,
-    CirculantMatrix
+    spectral_norm_regularization
 )
 
 
@@ -62,7 +61,10 @@ class AdaptiveFrequencyS6Block(nn.Module):
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.compression_ratio = compression_ratio
-        self.k = int(d_state * compression_ratio)  # Compressed state dimension
+        # Fix: Ensure k is compatible with FFT output size
+        freq_size = self.d_state // 2 + 1  # Real FFT output size
+        target_k = int(round(self.d_state * compression_ratio))
+        self.k = max(1, min(freq_size, target_k))  # Compressed state dimension
         self.use_adaptive_mask = use_adaptive_mask
         self.use_spectral_norm = use_spectral_norm
         
@@ -108,12 +110,9 @@ class AdaptiveFrequencyS6Block(nn.Module):
         self.dt_proj.bias._no_reinit = True
         
         # A parameter - frequency domain version
-        if use_spectral_norm:
-            # Use circulant matrix for better frequency domain properties
-            self.A_log = nn.Parameter(torch.randn(self.d_inner, self.k, **factory_kwargs))
-        else:
-            self.A_log = nn.Parameter(torch.randn(self.d_inner, self.d_state, **factory_kwargs))
-        
+        state_dim = self.k if use_spectral_norm else self.d_state
+        self.A_log = nn.Parameter(torch.randn(self.d_inner, state_dim, **factory_kwargs))
+
         # S6 structured matrix initialization
         A = repeat(
             torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
@@ -121,9 +120,10 @@ class AdaptiveFrequencyS6Block(nn.Module):
             d=self.d_inner,
         ).contiguous()
         A_log = torch.log(A)
-        self.A_log = nn.Parameter(A_log)
+        with torch.no_grad():
+            self.A_log.copy_(A_log[:, :state_dim].to(self.A_log.dtype))
         self.A_log._no_weight_decay = True
-        
+
         # D parameter (skip connection)
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
         self.D._no_weight_decay = True
@@ -207,31 +207,42 @@ class AdaptiveFrequencyS6Block(nn.Module):
     def adaptive_frequency_ssm_adaptive(self, deltaA, deltaB_u, C, u):
         """SSM with adaptive frequency selection"""
         batch, seqlen, d_inner, d_state = deltaA.shape
-        
-        # Convert to frequency domain
+
+        # Convert to frequency domain and ensure consistent dimensions
         deltaA_freq = slice_low_frequencies(deltaA, self.k, dim=-1)
         deltaB_u_freq = slice_low_frequencies(deltaB_u, self.k, dim=-1)
-        
+
+        # Ensure both have the same compressed dimension
+        compressed_dim = min(deltaA_freq.size(-1), deltaB_u_freq.size(-1))
+        deltaA_freq = deltaA_freq[..., :compressed_dim]
+        deltaB_u_freq = deltaB_u_freq[..., :compressed_dim]
+
         # Apply spectral normalization for stability
         if self.use_spectral_norm:
             deltaA_freq = spectral_norm_regularization(deltaA_freq)
-        
+
         # Frequency dropout for regularization
         if self.training:
             deltaA_freq = frequency_dropout(deltaA_freq, p=0.1, training=True)
-        
+
         # SSM recurrence in compressed frequency domain
         x_freq = self.parallel_scan_spectral(deltaA_freq, deltaB_u_freq)
-        
-        # Reconstruct to original dimension
-        x = pad_and_reconstruct(x_freq, d_state, dim=-1)
-        
-        # Output projection
-        y = torch.einsum('bldn,bln->bld', x, C)
-        
+
+        # Convert back to real domain for output projection
+        if x_freq.dtype.is_complex:
+            x_real = x_freq.real
+        else:
+            x_real = x_freq
+
+        # Keep compressed state and compress C to match
+        C_compressed = C[..., :compressed_dim]
+
+        # Output projection in compressed domain
+        y = torch.einsum('bldn,bln->bld', x_real, C_compressed)
+
         # Add skip connection
         y = y + u * self.D.unsqueeze(0).unsqueeze(0)
-        
+
         return y
     
     def adaptive_frequency_ssm_fixed(self, deltaA, deltaB_u, C, u):
@@ -277,13 +288,16 @@ class AdaptiveFrequencyS6Block(nn.Module):
     def _parallel_scan_associative(self, A, B):
         """Associative parallel scan using 2x2 matrix representation"""
         batch, seqlen, d_inner, d_state = A.shape
-        
+
+        # Ensure A and B have same dimensions
+        assert A.shape == B.shape, f"A shape {A.shape} != B shape {B.shape}"
+
         # Convert to associative matrix form: [h[t], 1] = M[t] @ [h[t-1], 1]
         # where M[t] = [[A[t], B[t]], [0, 1]]
-        matrices = torch.zeros(batch, seqlen, d_inner, d_state, 2, 2, 
+        matrices = torch.zeros(batch, seqlen, d_inner, d_state, 2, 2,
                               dtype=A.dtype, device=A.device)
         matrices[..., 0, 0] = A  # Transition component
-        matrices[..., 0, 1] = B  # Input component  
+        matrices[..., 0, 1] = B  # Input component
         matrices[..., 1, 1] = 1.0  # Identity for augmented dimension
         
         # Parallel prefix scan using tree reduction
@@ -296,8 +310,14 @@ class AdaptiveFrequencyS6Block(nn.Module):
         """Tree-based associative scan implementation"""
         batch, seqlen, d_inner, d_state, _, _ = matrices.shape
         
-        # Pad to next power of 2 for efficient tree operations
+        # Fix: Add memory bounds checking to prevent exponential memory growth
+        max_padded_len = min(2 ** 16, 4 * seqlen)  # Cap at 64K or 4x input size
         padded_len = 2 ** math.ceil(math.log2(seqlen)) if seqlen > 1 else 1
+
+        if padded_len > max_padded_len:
+            # Fall back to segmented processing for very long sequences
+            return self._parallel_scan_segmented_safe(matrices, segment_size=8192)
+
         if padded_len > seqlen:
             # Pad with identity matrices
             padding = torch.zeros(batch, padded_len - seqlen, d_inner, d_state, 2, 2,
@@ -373,6 +393,41 @@ class AdaptiveFrequencyS6Block(nn.Module):
             running_state = segment_result[:, -1]
         
         return torch.cat(segments, dim=1)
+
+    def _parallel_scan_segmented_safe(self, matrices, segment_size=8192):
+        """Safe segmented parallel scan with memory management for very long sequences"""
+        batch, seqlen, d_inner, d_state, _, _ = matrices.shape
+
+        segments = []
+        # Initialize running state as identity matrix
+        running_matrix = torch.eye(2, dtype=matrices.dtype, device=matrices.device)
+        running_matrix = running_matrix.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+            batch, d_inner, d_state, 2, 2
+        )
+
+        for i in range(0, seqlen, segment_size):
+            end_idx = min(i + segment_size, seqlen)
+            segment_len = end_idx - i
+
+            # Process segment
+            matrices_seg = matrices[:, i:end_idx]
+
+            # Apply running state to first element of segment
+            if i > 0:
+                first_elem = matrices_seg[:, 0:1]  # Shape: (batch, 1, d_inner, d_state, 2, 2)
+                # Matrix multiplication: first_elem = first_elem @ running_matrix
+                matrices_seg = matrices_seg.clone()  # Avoid in-place modification
+                matrices_seg[:, 0] = torch.matmul(first_elem[:, 0], running_matrix)
+
+            # Apply associative scan to segment
+            segment_result = self._associative_scan(matrices_seg)
+            segments.append(segment_result)
+
+            # Update running matrix for next segment
+            if segment_len > 0:
+                running_matrix = segment_result[:, -1]  # Last matrix of segment
+
+        return torch.cat(segments, dim=1)
     
     def get_ssm_params(self, u):
         """Get SSM parameters following S6 design"""
@@ -406,7 +461,7 @@ class AdaptiveFrequencyResidualBlock(nn.Module):
     ):
         super().__init__()
         
-        self.spectral_block = SpectralS6Block(
+        self.spectral_block = AdaptiveFrequencyS6Block(
             d_model=d_model,
             d_state=d_state,
             compression_ratio=compression_ratio,
@@ -487,12 +542,20 @@ class MultiHeadAdaptiveFrequencyAttention(nn.Module):
         v = v.view(batch, seqlen, self.num_heads, self.d_head).transpose(1, 2)
         
         # Spectral processing for attention scores
+        feature_dim = self.d_head
         if self.use_spectral and hasattr(self, 'spectral_processor'):
-            q, _ = self.spectral_processor(q, dim=-1)
-            k, _ = self.spectral_processor(k, dim=-1)
+            q_freq, _ = self.spectral_processor(q, dim=-1)
+            k_freq, _ = self.spectral_processor(k, dim=-1)
+            # Fix: Properly handle complex to real conversion for attention
+            q_real = torch.view_as_real(q_freq)  # Shape: (..., 2)
+            k_real = torch.view_as_real(k_freq)  # Shape: (..., 2)
+            # Flatten last two dimensions correctly
+            q = q_real.reshape(batch, self.num_heads, seqlen, -1)
+            k = k_real.reshape(batch, self.num_heads, seqlen, -1)
+            feature_dim = q.shape[-1]
         
         # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(feature_dim)
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
@@ -504,3 +567,4 @@ class MultiHeadAdaptiveFrequencyAttention(nn.Module):
         out = self.out_proj(out)
         
         return out
+

@@ -144,7 +144,8 @@ class PerformanceProfiler:
                 _ = model(input_ids)
         
         # Measure
-        torch.cuda.synchronize()
+        if torch.cuda.is_available() and self.device.type == 'cuda':
+            torch.cuda.synchronize()
         start_time = time.time()
         total_tokens = 0
         
@@ -157,7 +158,8 @@ class PerformanceProfiler:
                 _ = model(input_ids)
                 total_tokens += input_ids.numel()
         
-        torch.cuda.synchronize()
+        if torch.cuda.is_available() and self.device.type == 'cuda':
+            torch.cuda.synchronize()
         end_time = time.time()
         
         elapsed_time = end_time - start_time
@@ -179,7 +181,10 @@ class PerformanceProfiler:
         """Measure memory usage for different batch sizes"""
         model.eval()
         results = {}
-        
+
+        if not (torch.cuda.is_available() and self.device.type == 'cuda'):
+            return {f'batch_{b}': {'error': 'CUDA not available'} for b in batch_sizes}
+
         for batch_size in batch_sizes:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -222,13 +227,15 @@ class PerformanceProfiler:
         
         def forward_hook(name):
             def hook(module, input, output):
-                torch.cuda.synchronize()
+                if torch.cuda.is_available() and self.device.type == 'cuda':
+                    torch.cuda.synchronize()
                 layer_times[name] = time.time()
             return hook
         
         def backward_hook(name):
             def hook(module, grad_input, grad_output):
-                torch.cuda.synchronize()
+                if torch.cuda.is_available() and self.device.type == 'cuda':
+                    torch.cuda.synchronize()
                 if name in layer_times:
                     layer_times[name] = time.time() - layer_times[name]
             return hook
@@ -251,12 +258,14 @@ class PerformanceProfiler:
             for _ in range(num_runs):
                 layer_times.clear()
                 
-                torch.cuda.synchronize()
+                if torch.cuda.is_available() and self.device.type == 'cuda':
+                    torch.cuda.synchronize()
                 start_time = time.time()
                 
                 _ = model(input_ids)
                 
-                torch.cuda.synchronize()
+                if torch.cuda.is_available() and self.device.type == 'cuda':
+                    torch.cuda.synchronize()
                 end_time = time.time()
                 
                 # Record times
@@ -325,7 +334,7 @@ class SpectralSSMEvaluator:
         # Results storage
         self.results = {}
         
-    def load_model(self) -> SpectralSSM:
+    def load_model(self) -> AdaptiveFrequencySSM:
         """Load model from checkpoint"""
         checkpoint = torch.load(self.config.checkpoint_path, map_location=self.device)
         
@@ -382,7 +391,9 @@ class SpectralSSMEvaluator:
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                with autocast(enabled=self.config.use_amp):
+                device_type = self.device.type
+                amp_dtype = torch.bfloat16 if (device_type == 'cpu') else torch.bfloat16
+                with torch.amp.autocast(device_type=device_type, enabled=self.config.use_amp, dtype=amp_dtype):
                     outputs = self.model(input_ids=input_ids, labels=labels)
                     loss = outputs['loss']
                     logits = outputs['logits']
@@ -515,9 +526,14 @@ class SpectralSSMEvaluator:
         def update_block(module):
             if hasattr(module, 'compression_ratio'):
                 module.compression_ratio = ratio
-                module.k = int(module.d_state * ratio)
+            if hasattr(module, 'd_state') and hasattr(module, 'k'):
+                ds = int(module.d_state)
+                module.k = max(1, min(ds, int(round(ds * ratio))))
             if hasattr(module, 'freq_mask') and module.freq_mask is not None:
-                module.freq_mask.k = int(module.freq_mask.d_state * ratio)
+                fs = getattr(module.freq_mask, 'd_state', None)
+                if fs is not None:
+                    freq_size = fs // 2 + 1
+                    module.freq_mask.k = max(1, min(freq_size, int(round(fs * ratio))))
         
         # Apply to all modules
         self.model.apply(update_block)

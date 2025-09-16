@@ -7,142 +7,61 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
-from functools import wraps
 
 
-def preserve_dtype(func):
-    """Decorator to handle dtype conversion efficiently for FFT operations"""
-    @wraps(func)
-    def wrapper(x, *args, **kwargs):
-        original_dtype = x.dtype
-        needs_conversion = original_dtype == torch.bfloat16
-        
-        if needs_conversion:
-            x = x.float()
-        
-        result = func(x, *args, **kwargs)
-        
-        # For complex results, preserve higher precision
-        if needs_conversion and not result.dtype.is_complex:
-            result = result.to(torch.bfloat16)
-        
-        return result
-    return wrapper
+def _get_fft_dtype(input_dtype: torch.dtype) -> Tuple[torch.dtype, bool]:
+    """
+    Determine appropriate dtype for FFT operations based on input dtype.
+    Returns: (fft_dtype, needs_conversion_back)
+    """
+    if input_dtype == torch.bfloat16:
+        # bfloat16 not supported in FFT, use float32 for better precision
+        return torch.float32, True
+    elif input_dtype == torch.float16:
+        # float16 may have precision issues, consider using float32 for FFT
+        return torch.float32, True
+    else:
+        # float32, float64, etc. are supported natively
+        return input_dtype, False
 
 
-@preserve_dtype
-def _fft_core(x, operation, *args, **kwargs):
-    """Core FFT operation with consistent dtype handling"""
+def _fft_with_dtype_handling(x: torch.Tensor, operation: str, *args, **kwargs) -> torch.Tensor:
+    """Core FFT operation with proper dtype handling"""
+    original_dtype = x.dtype
+    fft_dtype, needs_conversion = _get_fft_dtype(original_dtype)
+
+    # Convert to appropriate dtype for FFT if needed
+    if needs_conversion:
+        x = x.to(fft_dtype)
+
+    # Perform FFT operation
     if operation == 'rfft':
-        return torch.fft.rfft(x, *args, **kwargs)
+        result = torch.fft.rfft(x, *args, **kwargs)
     elif operation == 'irfft':
-        return torch.fft.irfft(x, *args, **kwargs)
+        result = torch.fft.irfft(x, *args, **kwargs)
     elif operation == 'fft':
-        return torch.fft.fft(x, *args, **kwargs)
+        result = torch.fft.fft(x, *args, **kwargs)
     elif operation == 'ifft':
-        return torch.fft.ifft(x, *args, **kwargs)
+        result = torch.fft.ifft(x, *args, **kwargs)
     else:
         raise ValueError(f"Unknown FFT operation: {operation}")
 
+    # Convert back to original dtype if needed and result is real
+    if needs_conversion and not result.dtype.is_complex:
+        result = result.to(original_dtype)
+
+    return result
+
 
 def real_fft(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Real FFT with optimized dtype handling for spectral analysis"""
-    return _fft_core(x, 'rfft', dim=dim, norm='ortho')
+    """Real FFT with proper dtype handling for spectral analysis"""
+    return _fft_with_dtype_handling(x, 'rfft', dim=dim, norm='ortho')
 
 
 def real_ifft(x: torch.Tensor, n: Optional[int] = None, dim: int = -1) -> torch.Tensor:
-    """Inverse real FFT with optimized dtype handling"""
-    return _fft_core(x, 'irfft', n=n, dim=dim, norm='ortho')
+    """Inverse real FFT with proper dtype handling"""
+    return _fft_with_dtype_handling(x, 'irfft', n=n, dim=dim, norm='ortho')
 
-
-def dct(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Discrete Cosine Transform using efficient FFT implementation"""
-    original_dtype = x.dtype
-    needs_conversion = original_dtype == torch.bfloat16
-    
-    if needs_conversion:
-        x = x.float()
-    
-    N = x.size(dim)
-    x_pad = torch.cat([x, x.flip(dims=[dim])], dim=dim)
-    
-    X = torch.fft.fft(x_pad, dim=dim)
-    X = X.narrow(dim, 0, N)
-    
-    # DCT-II scaling
-    k = torch.arange(N, dtype=x.dtype, device=x.device)
-    W = torch.exp(-1j * torch.pi * k / (2 * N))
-    
-    if dim == -1:
-        X = X * W
-    else:
-        shape = [1] * x.ndim
-        shape[dim] = N
-        W = W.view(shape)
-        X = X * W
-    
-    result = X.real
-    if needs_conversion:
-        result = result.to(torch.bfloat16)
-    return result
-
-
-def idct(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Inverse Discrete Cosine Transform with optimized precision handling"""
-    original_dtype = x.dtype
-    needs_conversion = original_dtype == torch.bfloat16
-    
-    if needs_conversion:
-        x = x.float()
-    
-    N = x.size(dim)
-    
-    # Create frequency scaling
-    k = torch.arange(N, dtype=x.dtype, device=x.device)
-    W = torch.exp(1j * torch.pi * k / (2 * N))
-    
-    if dim == -1:
-        X = x * W
-    else:
-        shape = [1] * x.ndim
-        shape[dim] = N
-        W = W.view(shape)
-        X = x * W
-    
-    # Extend for IFFT
-    X_ext = torch.zeros(*x.shape[:-1], 2*N, dtype=torch.complex64, device=x.device)
-    X_ext.narrow(dim, 0, N).copy_(X.to(torch.complex64))
-    
-    # Conjugate symmetry for real result
-    if dim == -1:
-        X_ext[..., N:] = X_ext[..., 1:N].flip(dims=[-1]).conj()
-    else:
-        X_ext = X_ext.transpose(dim, -1)
-        X_ext[..., N:] = X_ext[..., 1:N].flip(dims=[-1]).conj()
-        X_ext = X_ext.transpose(dim, -1)
-    
-    result = torch.fft.ifft(X_ext, dim=dim).real
-    result = result.narrow(dim, 0, N) * 2
-    if needs_conversion:
-        result = result.to(torch.bfloat16)
-    return result
-
-
-def get_top_k_frequencies(x: torch.Tensor, k: int, dim: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Extract the k most significant frequency components by magnitude.
-    Returns: (top_k_values, indices)
-    """
-    freqs = real_fft(x, dim=dim)
-    magnitudes = torch.abs(freqs)
-    
-    # Find the indices of the largest magnitude components
-    _, indices = torch.topk(magnitudes, k, dim=dim)
-    
-    # Extract the corresponding frequency values
-    top_k_freqs = torch.gather(freqs, dim, indices)
-    
-    return top_k_freqs, indices
 
 
 def slice_low_frequencies(x: torch.Tensor, k: int, dim: int = -1) -> torch.Tensor:
@@ -151,7 +70,15 @@ def slice_low_frequencies(x: torch.Tensor, k: int, dim: int = -1) -> torch.Tenso
     This serves as our primary compression method.
     """
     freqs = real_fft(x, dim=dim)
-    return freqs.narrow(dim, 0, k)
+    freq_size = freqs.size(dim)
+
+    # Ensure k doesn't exceed available frequencies
+    k_safe = min(k, freq_size)
+
+    if k_safe <= 0:
+        raise ValueError(f"Invalid k={k} for frequency dimension size {freq_size}")
+
+    return freqs.narrow(dim, 0, k_safe)
 
 
 def pad_and_reconstruct(x_compressed: torch.Tensor, original_size: int, dim: int = -1) -> torch.Tensor:
@@ -182,10 +109,11 @@ class AdaptiveFrequencyMask(torch.nn.Module):
     def __init__(self, d_state: int, compression_ratio: float = 0.5):
         super().__init__()
         self.d_state = d_state
-        self.k = int(d_state * compression_ratio)
+        freq_size = d_state // 2 + 1  # rfft output size
+        target_k = int(round(d_state * compression_ratio))
+        self.k = max(1, min(freq_size, target_k))
         
         # Learnable importance weights for each frequency
-        freq_size = d_state // 2 + 1  # rfft output size
         self.freq_weights = torch.nn.Parameter(torch.ones(freq_size))
         self.temperature = torch.nn.Parameter(torch.tensor(1.0))
         
@@ -211,8 +139,17 @@ class AdaptiveFrequencyMask(torch.nn.Module):
         if dim == -1:
             compressed_freqs = freqs[..., mask]
         else:
-            mask_expanded = mask.view([1] * dim + [mask.size(0)] + [1] * (freqs.ndim - dim - 1))
-            compressed_freqs = freqs[mask_expanded.expand_as(freqs)].view(*freqs.shape[:dim], self.k, *freqs.shape[dim+1:])
+            # Fix: Proper mask broadcasting for arbitrary dimensions
+            mask_shape = [1] * freqs.ndim
+            mask_shape[dim] = mask.size(0)
+            mask_expanded = mask.view(mask_shape)
+
+            # Create boolean mask by expanding to match freqs dimensions
+            bool_mask = mask_expanded.expand_as(freqs)
+
+            # Use advanced indexing to select frequencies
+            selected_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            compressed_freqs = torch.index_select(freqs, dim, selected_indices)
         
         return compressed_freqs, mask
 
@@ -228,42 +165,6 @@ def frequency_dropout(x: torch.Tensor, p: float = 0.1, training: bool = True) ->
     return x * mask.to(x.dtype)
 
 
-def multi_scale_fft(x: torch.Tensor, scales: list = [1, 2, 4]) -> list:
-    """
-    Multi-scale FFT analysis for different temporal resolutions
-    """
-    results = []
-    for scale in scales:
-        if scale == 1:
-            results.append(real_fft(x))
-        else:
-            # Downsample and analyze
-            downsampled = F.avg_pool1d(x.unsqueeze(1), kernel_size=scale, stride=scale).squeeze(1)
-            results.append(real_fft(downsampled))
-    
-    return results
-
-
-class CirculantMatrix(torch.nn.Module):
-    """
-    Circulant matrix for frequency domain operations
-    A circulant matrix can be diagonalized by FFT
-    """
-    def __init__(self, size: int):
-        super().__init__()
-        self.size = size
-        self.first_row = torch.nn.Parameter(torch.randn(size))
-    
-    def get_eigenvalues(self) -> torch.Tensor:
-        """Get eigenvalues via FFT of first row"""
-        return torch.fft.fft(self.first_row)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply circulant matrix multiplication via FFT"""
-        x_freq = torch.fft.fft(x, dim=-1)
-        eigenvals = self.get_eigenvalues()
-        result_freq = x_freq * eigenvals
-        return torch.fft.ifft(result_freq, dim=-1).real
 
 
 def spectral_norm_regularization(A_freq: torch.Tensor, max_eigenval: float = 1.0) -> torch.Tensor:

@@ -133,7 +133,7 @@ class AdaptiveFrequencySSMBackbone(nn.Module):
         for i in range(config.n_layer):
             if config.use_hybrid_attention and i in config.attention_layers:
                 # Use attention layer at specified positions
-                layer = MultiHeadSpectralAttention(
+                layer = MultiHeadAdaptiveFrequencyAttention(
                     d_model=config.d_model,
                     num_heads=config.d_model // 64,
                     dropout=config.dropout,
@@ -386,7 +386,7 @@ class AdaptiveFrequencySSM(nn.Module):
     Main Spectral SSM Model - unified interface
     """
     
-    def __init__(self, config: SpectralSSMConfig, task: str = "classification", device=None, dtype=None):
+    def __init__(self, config: AdaptiveFrequencySSMConfig, task: str = "classification", device=None, dtype=None):
         super().__init__()
         
         self.config = config
@@ -421,7 +421,7 @@ class AdaptiveFrequencySSM(nn.Module):
         standard_flops = seq_len * d_inner * d_state
         
         # Spectral SSM FLOPs per layer (compressed state)
-        compressed_state = int(d_state * compression_ratio)
+        compressed_state = max(1, int(round(d_state * compression_ratio)))
         spectral_flops = (
             seq_len * d_inner * compressed_state +  # Compressed recurrence
             d_state * math.log2(d_state) * 2  # FFT operations
@@ -467,3 +467,5 @@ def create_adaptive_frequency_ssm_model(
     )
     
     return AdaptiveFrequencySSM(config, task=task)
+
+
